@@ -1,0 +1,78 @@
+name: Build
+
+# Compiles the tweak with Theos on GitHub's macOS runners and publishes the .deb
+# packages. No decrypted IPA is needed here — this only builds the tweak itself.
+#   * rootful      -> legacy jailbreaks
+#   * rootless     -> modern jailbreaks (Dopamine, palera1n rootless, …)
+#   * sideloading  -> for injecting into your own decrypted IPA with Azule/cyan
+# Trigger manually from the Actions tab ("Run workflow") or on push to main.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore: [ '**.md' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install ldid dpkg
+
+      - name: Set up Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          submodules: recursive
+          path: theos
+
+      - name: Download iOS 16.5 SDK
+        run: |
+          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks.git sdks-tmp
+          cd sdks-tmp
+          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
+          git checkout
+          mkdir -p "$GITHUB_WORKSPACE/theos/sdks"
+          mv iPhoneOS16.5.sdk "$GITHUB_WORKSPACE/theos/sdks/"
+
+      - name: Build packages
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          set -e
+          shopt -s nullglob
+          mkdir -p out
+          build () {           # $1 = label, remaining = extra make args
+            local label="$1"; shift
+            make clean package FINALPACKAGE=1 "$@"
+            for f in packages/*.deb; do
+              mv "$f" "out/YTMusicUltimate-${label}-$(basename "$f")"
+            done
+          }
+          build rootful
+          build rootless    ROOTLESS=1
+          build sideloading SIDELOADING=1
+          echo "== built ==" && ls -lh out
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: YTMusicUltimate-packages
+          path: out/*.deb
+
+      - name: Publish release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="build-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$tag" out/*.deb \
+            --title "YTMusicUltimate $tag" \
+            --notes "Automated Theos build — rootful / rootless / sideloading .debs."
