@@ -1,78 +1,117 @@
-name: Build
-
-# Compiles the tweak with Theos on GitHub's macOS runners and publishes the .deb
-# packages. No decrypted IPA is needed here — this only builds the tweak itself.
-#   * rootful      -> legacy jailbreaks
-#   * rootless     -> modern jailbreaks (Dopamine, palera1n rootless, …)
-#   * sideloading  -> for injecting into your own decrypted IPA with Azule/cyan
-# Trigger manually from the Actions tab ("Run workflow") or on push to main.
-
+name: Build and Release YTMusicUltimate
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths-ignore: [ '**.md' ]
+    inputs: 
+      ipa_url:
+        description: "URL to the decrypted IPA file"
+        default: ""
+        required: true
+        type: string
 
-permissions:
-  contents: write
+      display_name:
+        description: "App Name (Optional)"
+        default: "YouTube Music"
+        required: true
+        type: string
+
+      bundle_id:
+        description: "BundleID (Optional)"
+        default: "com.google.ios.youtubemusic"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: macos-14
+    name: Build YTMusicUltimate
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout Main
+        uses: actions/checkout@v6.0.2
+        with:
+          path: main
+          submodules: recursive
 
-      - name: Install build tools
-        run: brew install ldid dpkg
+      - name: Hide sensitive inputs
+        uses: levibostian/action-hide-sensitive-inputs@v1
+        with:
+          exclude_inputs: bundle_id,display_name
 
-      - name: Set up Theos
-        uses: actions/checkout@v4
+      - name: Validate IPA URL
+        run: |
+          curl -L -r 0-1023 -o sample.part "${{ inputs.ipa_url }}" > /dev/null 2>&1
+          
+          file_type=$(file --mime-type -b sample.part)
+
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::Validation failed: The file is not a valid IPA file. Detected type: $file_type."
+            exit 1
+          fi
+
+      - name: Install Dependencies
+        run: brew install make ldid
+
+      - name: Set PATH environment variables
+        run: |
+          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+          echo "THEOS=${{ github.workspace }}/theos" >> $GITHUB_ENV
+
+      - name: Cache Theos
+        id: theos
+        uses: actions/cache@v5.0.3
+        env:
+          cache-name: theos_cache_344ee59
+        with:
+          path: theos/
+          key: ${{ env.cache-name }}
+          restore-keys: ${{ env.cache-name }}
+
+      - name: Setup Theos
+        if: steps.theos.outputs.cache-hit != 'true'
+        uses: actions/checkout@v6.0.2
         with:
           repository: theos/theos
-          submodules: recursive
+          ref: 344ee5925df036dbd1312b783ad5a00d153c2445
           path: theos
+          submodules: recursive
 
-      - name: Download iOS 16.5 SDK
+      - name: Download iOS SDK
+        if: steps.theos.outputs.cache-hit != 'true'
         run: |
-          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks.git sdks-tmp
-          cd sdks-tmp
+          git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/theos/sdks.git
+          cd sdks
           git sparse-checkout set --no-cone iPhoneOS16.5.sdk
           git checkout
-          mkdir -p "$GITHUB_WORKSPACE/theos/sdks"
-          mv iPhoneOS16.5.sdk "$GITHUB_WORKSPACE/theos/sdks/"
+          mv *.sdk $THEOS/sdks
 
-      - name: Build packages
-        env:
-          THEOS: ${{ github.workspace }}/theos
+      - name: Install cyan
+        run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+      - name: Download YouTube Music
+        run: wget "${{ inputs.ipa_url }}" --no-verbose -O ytm.ipa
+
+      - name: Build Tweak for Sideloading
         run: |
-          set -e
-          shopt -s nullglob
-          mkdir -p out
-          build () {           # $1 = label, remaining = extra make args
-            local label="$1"; shift
-            make clean package FINALPACKAGE=1 "$@"
-            for f in packages/*.deb; do
-              mv "$f" "out/YTMusicUltimate-${label}-$(basename "$f")"
-            done
-          }
-          build rootful
-          build rootless    ROOTLESS=1
-          build sideloading SIDELOADING=1
-          echo "== built ==" && ls -lh out
+          cd main
+          make clean package DEBUG=0 FINALPACKAGE=1 SIDELOADING=1
+          mv packages/*.deb ../ytmult.deb
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      - name: Inject tweak into provided IPA
+        run: cyan -i ytm.ipa -o YTMusicUltimate.ipa -uwsf ytmult.deb -n "${{ inputs.display_name }}" -b ${{ inputs.bundle_id }} 
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2.5.0
         with:
-          name: YTMusicUltimate-packages
-          path: out/*.deb
+          name: YTMusicUltimate (${{ github.run_number }})
+          files: YTMusicUltimate.ipa
+          draft: true
 
-      - name: Publish release
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Output Release URL
         run: |
-          tag="build-$(date -u +%Y%m%d-%H%M%S)"
-          gh release create "$tag" out/*.deb \
-            --title "YTMusicUltimate $tag" \
-            --notes "Automated Theos build — rootful / rootless / sideloading .debs."
+          echo "::notice::Release available at: https://github.com/${{ github.repository }}/releases"
